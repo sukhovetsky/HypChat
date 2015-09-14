@@ -92,6 +92,7 @@ class HypChat(object):
         self.rooms = Linker('{0}/v2/room'.format(endpoint), _requests=self._requests)
         self.users_url = '{0}/v2/user'.format(endpoint)
         self.endpoint = endpoint
+        self.token = token
 
     def users(self, **ops):
         """users([guests=bool], [deleted=bool]) -> UserCollection
@@ -108,18 +109,17 @@ class HypChat(object):
         resp = self._requests.get(self.users_url, params=params)
         return Linker._obj_from_text(resp.text, self._requests)
 
-
     def fromurl(self, url, **kwargs):
-        return Linker(url, _requests=self._requests)(**kwargs)
+        return Linker(url, _requests=self._requests, _token=self.token)(**kwargs)
 
     def create_room(self, name, owner=Ellipsis, privacy='public', guest_access=True):
         """
         Creates a new room.
         """
         data = {
-        'name': name,
-        'privacy': privacy,
-        'guest_access': guest_access,
+            'name': name,
+            'privacy': privacy,
+            'guest_access': guest_access,
         }
         if owner is not Ellipsis:
             if owner is None:
@@ -134,13 +134,13 @@ class HypChat(object):
         Creates a new user.
         """
         data = {
-        'name': name,
-        'email': email,
-        'title': title,
-        'mention_name': mention_name,
-        'is_group_admin': is_group_admin,
-        'timezone': timezone,  # TODO: Support timezone objects
-        'password': password,
+            'name': name,
+            'email': email,
+            'title': title,
+            'mention_name': mention_name,
+            'is_group_admin': is_group_admin,
+            'timezone': timezone,  # TODO: Support timezone objects
+            'password': password,
         }
         resp = self._requests.post(self.users_url, data=data)
         return Linker._obj_from_text(resp.text, self._requests)

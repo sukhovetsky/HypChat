@@ -5,6 +5,8 @@ import datetime
 import dateutil.parser
 import dateutil.tz
 import six
+import asyncio
+import aiohttp
 
 _urls_to_objects = {}
 
@@ -16,7 +18,7 @@ def timestamp(dt):
     HipChat uses ISO 8601, optionally with the timezone attached. Except for when they use a timestamp.
     """
     # '2013-12-05T22:42:18+00:00' <== History
-    #'2013-11-27T15:33:24' <== Rooms, Users
+    # '2013-11-27T15:33:24' <== Rooms, Users
     if dt is None:
         return
     if isinstance(dt, int):
@@ -45,10 +47,11 @@ class Linker(object):
     """
     url = None
 
-    def __init__(self, url, parent=None, _requests=None):
+    def __init__(self, url, parent=None, _requests=None, _token=None):
         self.url = url
         self.__parent = parent
         self._requests = _requests or __import__('requests')
+        self._token = _token
 
     @staticmethod
     def _obj_from_text(text, requests):
@@ -92,6 +95,7 @@ class Linker(object):
         rv._requests = self._requests
         if self.__parent is not None:
             rv.parent = self.__parent
+        rv._token = self._token
         return rv
 
     def __repr__(self):
@@ -125,7 +129,27 @@ class RestObject(dict):
 _at_mention = re.compile('@[\w]+(?: |$)')
 
 
-class Room(RestObject):
+class MultiPart(RestObject):
+    def _multipart_request(self, message, filename):
+        with aiohttp.MultipartWriter('related') as writer:
+            writer.append_json({'message': message})
+            file_part = writer.append(open(filename, 'rb'))
+            file_part.set_content_disposition('attachment',
+                                              filename=re.sub('\s+', '_', filename.split('/')[-1]),
+                                              name='file')
+            body = b''.join(writer.serialize())
+            writer.headers.update({
+                "Authorization": "Bearer {}".format(self._token),
+            })
+
+            yield from aiohttp.request('POST', self.url + '/share/file',
+                                       data=body, headers=writer.headers)
+
+    def share_file(self, message, filename):
+        asyncio.get_event_loop().run_until_complete(self._multipart_request(message, filename))
+
+
+class Room(MultiPart, RestObject):
     def __init__(self, *p, **kw):
         super(Room, self).__init__(*p, **kw)
         if 'last_active' in self:
@@ -140,11 +164,14 @@ class Room(RestObject):
         data = {'message': message, 'parentMessageId': parent_message_id}
         self._requests.post(self.url + '/reply', data=data)
 
-    def message(self, message):
-        """
-        Redirects to the /reply URL with an empty parentMessageId
-        """
-        return self.reply(message, parent_message_id='')
+    def message(self, message, attachment=None):
+        if attachment is None:
+            """
+            Redirects to the /reply URL with an empty parentMessageId
+            """
+            return self.reply(message, parent_message_id='')
+        else:
+            self.share_file(message, attachment)
 
     def notification(self, message, color=None, notify=False, format=None):
         """
@@ -165,7 +192,7 @@ class Room(RestObject):
         Set a room's topic. Useful for displaying statistics, important links, server status, you name it!
         """
         self._requests.put(self.url + '/topic', data={
-        'topic': text,
+            'topic': text,
         })
 
     def history(self, date='recent', maxResults=200):
@@ -178,9 +205,9 @@ class Room(RestObject):
         if date != 'recent':
             date, tz = mktimestamp(date)
         params = {
-        'date': date,
-        'timezone': tz,
-        'max-results': maxResults,
+            'date': date,
+            'timezone': tz,
+            'max-results': maxResults,
         }
         resp = self._requests.get(self.url + '/history', params=params)
         return Linker._obj_from_text(resp.text, self._requests)
@@ -192,7 +219,7 @@ class Room(RestObject):
         If ``not_before`` is provided, messages that precede the message id will not be returned
         """
         params = {
-        "max-results": maxResults
+            "max-results": maxResults
         }
         if not_before is not None:
             params["not-before"] = not_before
@@ -202,7 +229,7 @@ class Room(RestObject):
 
     def invite(self, user, reason):
         self._requests.post(self.url + '/invite/%s' % user['id'], data={
-        'reason': reason,
+            'reason': reason,
         })
 
     def create_webhook(self, url, event, pattern=None, name=None):
@@ -210,10 +237,10 @@ class Room(RestObject):
         Creates a new webhook.
         """
         data = {
-        'url': url,
-        'event': event,
-        'pattern': pattern,
-        'name': name,
+            'url': url,
+            'event': event,
+            'pattern': pattern,
+            'name': name,
         }
         resp = self._requests.post(self.url + '/webhook', data=data)
         return Linker._obj_from_text(resp.text, self._requests)
@@ -230,7 +257,7 @@ class Room(RestObject):
 _urls_to_objects[re.compile(r'https://[^/]+/v2/room/[^/]+$')] = Room
 
 
-class User(RestObject):
+class User(MultiPart, RestObject):
     def __init__(self, *p, **kw):
         super(User, self).__init__(*p, **kw)
         if 'last_active' in self:
@@ -238,15 +265,18 @@ class User(RestObject):
         if 'created' in self:
             self['created'] = timestamp(self['created'])
 
-    def message(self, message, message_format='text', notify=False):
+    def message(self, message, message_format='text', notify=False, attachment=None):
         """
         Sends a user a private message.
         """
-        self._requests.post(self.url + '/message', data={
-        'message': message,
-        'message_format': message_format,
-        'notify': notify,
-        })
+        if attachment is None:
+            self._requests.post(self.url + '/message', data={
+                'message': message,
+                'message_format': message_format,
+                'notify': notify,
+            })
+        else:
+            self.share_file(message, attachment)
 
     def history(self, maxResults=200, notBefore=None):
         """
@@ -256,8 +286,8 @@ class User(RestObject):
         """
         tz = 'UTC'
         params = {
-        'timezone': tz,
-        'max-results': maxResults,
+            'timezone': tz,
+            'max-results': maxResults,
 
         }
         if notBefore is not None:
@@ -326,13 +356,13 @@ class UserCollection(RestObject, Collection):
         Creates a new user.
         """
         data = {
-        'name': name,
-        'email': email,
-        'title': title,
-        'mention_name': mention_name,
-        'is_group_admin': is_group_admin,
-        'timezone': timezone,  # TODO: Support timezone objects
-        'password': password,
+            'name': name,
+            'email': email,
+            'title': title,
+            'mention_name': mention_name,
+            'is_group_admin': is_group_admin,
+            'timezone': timezone,  # TODO: Support timezone objects
+            'password': password,
         }
         resp = self._requests.post(self.url, data=data)
         return Linker._obj_from_text(resp.text, self._requests)
@@ -347,9 +377,9 @@ class RoomCollection(RestObject, Collection):
         Creates a new room.
         """
         data = {
-        'name': name,
-        'privacy': privacy,
-        'guest_access': guest_access,
+            'name': name,
+            'privacy': privacy,
+            'guest_access': guest_access,
         }
         if owner is not Ellipsis:
             if owner is None:
@@ -369,13 +399,13 @@ class WebhookCollection(RestObject, Collection):
         Creates a new webhook.
         """
         data = {
-        'name': name,
-        'email': email,
-        'title': title,
-        'mention_name': mention_name,
-        'is_group_admin': is_group_admin,
-        'timezone': timezone,  # TODO: Support timezone objects
-        'password': password,
+            'name': name,
+            'email': email,
+            'title': title,
+            'mention_name': mention_name,
+            'is_group_admin': is_group_admin,
+            'timezone': timezone,  # TODO: Support timezone objects
+            'password': password,
         }
         resp = self._requests.post(self.url, data=data)
         return Linker._obj_from_text(resp.text, self._requests)
